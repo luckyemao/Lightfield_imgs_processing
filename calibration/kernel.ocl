@@ -1,0 +1,55 @@
+#include "LF.h"
+
+__kernel void drawMLA(__global unsigned char* image_data, __global struct MLAParam* param)
+{
+
+    double o[4][2] = {{0,0}, {param->Matrix[0],param->Matrix[2]}, {param->Matrix[1],param->Matrix[3]}, {param->Matrix[0]+param->Matrix[1],param->Matrix[2]+param->Matrix[3]}};
+    double x = get_global_id(0);
+    double y = get_global_id(1);
+    int ind = (y * param->Width + x) * 3;
+    
+    if (x==0 && y==0)
+    {
+        printf("Matrix: [%lf %lf; %lf %lf]\nInverse matrix: [%lf %lf; %lf %lf]\nOrigin point: %lf %lf\nDiameter: %lf\nImage Size: %d %d\n",
+            param->Matrix[0], param->Matrix[1], param->Matrix[2], param->Matrix[3], 
+            param->InvMatrix[0], param->InvMatrix[1], param->InvMatrix[2], param->InvMatrix[3], 
+            param->Origin[0], param->Origin[1],
+            param->Diameter,
+            param->Width, param->Height
+        );
+    }
+    
+    double ox = x - param->Origin[0], oy = y - param->Origin[1];
+
+    double s = param->InvMatrix[0] * ox + param->InvMatrix[1] * oy, t = param->InvMatrix[2] * ox + param->InvMatrix[3] * oy;
+    double is = floor(s), it = floor(t);
+    double cx = param->Matrix[0] * is + param->Matrix[1] * it, cy = param->Matrix[2] * is + param->Matrix[3] * it;
+    /*
+    for (int i = 0; i<3; ++i)
+    {
+        if (convert_int(iIx + iIy + 9) % 3 == i)
+        {
+            image_data[ind + i] = 255;
+        }
+        else
+            image_data[ind + i] = 0;
+    }
+    */
+    
+    for (int i=0; i<4; ++i)
+    {     
+    
+    /*这里ox 是x代表un，y代表yn，Origin[0]是offsetx，Origin[1]是offsety，所以距离是{un-（offsetx+cx）}平方 加
+    {uy-（offsety+cy）}平方, 然后分别对三个孔径求的距离。当当前像素点落在公共区域内，则无法分辨是在哪个孔径，只能取最小的，然后再挨个找*/
+
+        double dist = sqrt((ox - cx - o[i][0]) * (ox - cx - o[i][0]) + (oy - cy - o[i][1]) * (oy - cy - o[i][1]));
+        if (fabs(dist - param->Diameter / 2) < 3)
+        {
+            image_data[ind] = 0;
+            image_data[ind+1] = 255;
+            image_data[ind+2] = 0;
+        }
+        /*程序详解：这里实际是求相片中某一个像素点a到对应的周围三个架上自己共四个微透镜中心的距离，然后圆心以外的像素点标绿色。根据公式，某一个像素点对应在哪个孔径中，由于用的
+        向下取整函数floor，所以得到的是最左上的孔径，所以需要分别对正右边，左下方，以及这两个中间的一个孔径分别求距离，满足要求就标绿*/
+    }
+}

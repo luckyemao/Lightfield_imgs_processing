@@ -1,0 +1,199 @@
+#include "LF.h"
+
+
+
+__kernel void view_depth_kernel(__constant struct MLAParam* param, __global unsigned char* raw_depth, __global unsigned char* view_depth)
+{
+    int x = get_global_id(0);
+    int y = get_global_id(1);//这里直接以孔径编号计算
+    double  cx = param->Matrix[0] * x + param->Matrix[1] * y + param->Origin[0],
+            cy = param->Matrix[2] * x + param->Matrix[3] * y + param->Origin[1];
+            //获取孔径中心的像素坐标
+        
+    
+    //printf("%f %f\n", cx, cy);
+    int radius = convert_int(param->Diameter / 3);  //初始值为12
+    view_depth[y * param->Cols + x] = 1;//每个孔径对应设置为0
+
+
+    if (!(0 <= cx && cx < param->Width && 0 <= cy && cy <= param->Height))
+        return;//判断孔径坐标是否在图像范围内
+
+    //初始化变量
+    int disp_cnt[100] = { 0 }; //= (unsigned char*)malloc(convert_int(param->Diameter + 1));
+    int disp_sum = 0;
+
+    for (int i = 0; i < radius; ++i)
+    {
+        for (int j = 0; j < radius; ++j)//这里用了12 乘以 12 的block进行遍历 
+        {
+            int xx = (convert_int(cx - radius / 2) + i), yy = (convert_int(cy) - radius / 2 + j);
+            if (0 <= xx && xx < param->Width && 0 <= yy && yy < param->Height) //判断孔径中心坐标上下12个像素是否也在图像范围内
+            {
+                int ind = xx + yy * param->Width;
+                if (0 < raw_depth[ind] && raw_depth[ind] < param->Diameter) //判断这些block中的像素对应的视差是否在0 到 37之间 （实际上肯定满足了呀）
+                {
+                    disp_cnt[raw_depth[ind]]++;//这是分别吧对应视差的个数统计出来吗  例如 视差为8的个数有几个
+                    disp_sum++;//这个是总共有多少像素满足要求
+                }
+            }
+
+        }
+    }
+    if (disp_sum == 0)//如果一个满足视差要求的中心坐标都没有  直接返回
+        return;
+    int tmp_disp_sum = 0;
+    // for (int i = 1; i < param->Diameter; ++i)//视差遍历 其实根据作者前面的设定  视差最大值是20
+    // {
+    //     tmp_disp_sum += disp_cnt[i];  //将1到37之间所有视差个数加起来
+    //     if (tmp_disp_sum * 2 > disp_sum)//如果1-37之间视差个数的2倍大于0-37视差的个数  理论上应该很容易满足呀  实际再找中位数
+    //     {
+    //         view_depth[y * param->Cols + x] = i;  //如果满足要求就将加到i的值记录 为及st个孔径的深度
+    //         break;
+    //     }
+    // }
+    int dis_sum;
+    for (int i = 1; i < param->Diameter; ++i)//视差遍历 其实根据作者前面的设定  视差最大值是20
+    {
+        tmp_disp_sum += disp_cnt[i];  //将1到37之间所有视差个数加起来
+        dis_sum+=disp_cnt[i]*i;      //视差总和
+    }
+    view_depth[y * param->Cols + x] = convert_int(dis_sum/disp_sum);  //求平均视差
+}
+
+
+__kernel void Disp(
+    __constant struct MLAParam* param, __constant struct StereoParam* sparam,
+    __global unsigned char* src_buffer, __global unsigned char* depth_buffer,__global unsigned char* disp_buffer,__global unsigned char* flag_buffer
+)
+{
+
+    int x = get_global_id(0);
+    int y = get_global_id(1);
+    int ind = (get_global_id(1) * param->Width + get_global_id(0));
+    depth_buffer[ind] = 0;//深度 默认值初始为0 test test
+    //printf("printimg[i]%d",src_buffer[2000 * param->Width + 3500] );
+    /*当前get的像素点在上下左右两个直径内就不用管了 直接return*/
+    if (x==100 && y==100)
+    {
+        printf("printimg[i]%d\n",src_buffer[(100 * param->Width + 100)] );
+        printf("printimg[i]%d\n",src_buffer[(100 * param->Width + 100)+1] );
+        printf("printimg[i]%d\n",src_buffer[(100 * param->Width + 100)+2] );
+        
+    }
+
+
+
+    if (x < param->Diameter * 2 || param->Width - param->Diameter * 2 < x || y < param->Diameter * 2 || param->Height - param->Diameter * 2 < y)
+        return;
+
+    double dir[6][2]; /*附近的6个孔径的像素偏移量系数*/
+    //0【1,0】，1【-1/2，根3/2】，2【-1/2，根3/2】，3【-1，0】，4【-1/2，-根3/2】，5【1/2，-根3/2】
+
+    for (int i = 0; i < 6; ++i)
+    {
+        dir[i][0] = cos(param->Rotation + M_PI * i / 3);
+        dir[i][1] = sin(param->Rotation + M_PI * i / 3);
+
+    }
+
+    double o[4][2] = { {0,0}, {param->Matrix[0],param->Matrix[2]}, {param->Matrix[1],param->Matrix[3]}, {param->Matrix[0] + param->Matrix[1],param->Matrix[2] + param->Matrix[3]} };
+    int oid[4][2] = { {0,0},{1,0},{0,1},{1,1} };//这里顺序可能有误 如果要与上面的矩阵对应  应该是 {0,0},{1,0},{0,1},{1,1} 
+                                                //o矩阵实际代表的是中心点 与 右下方的三个孔的像素偏移量 D已经乘在了矩阵内部
+
+    double ox = x - param->Origin[0], oy = y - param->Origin[1];
+    double s = param->InvMatrix[0] * ox + param->InvMatrix[1] * oy, t = param->InvMatrix[2] * ox + param->InvMatrix[3] * oy;
+    double is = floor(s), it = floor(t);
+    double cx = param->Matrix[0] * is + param->Matrix[1] * it, cy = param->Matrix[2] * is + param->Matrix[3] * it;
+    double dist;
+    //常规操作求中心点坐标像素  cx还需要加上偏置才是真正的像素坐标
+    //代码块1截切处（为方便阅读，没有用到的代码放后面去了）
+
+    for (int i = 0; i < 4; ++i)//由于上面取得是最小st 需要确定该像素点到底属于哪个孔径
+    {
+        double dx = ox - cx - o[i][0], dy = oy - cy - o[i][1], src_x, src_y;//这里就是当前像素与中心和外环3个中心坐标共计4个的距离
+        dist = sqrt(dx * dx + dy * dy);
+        if (dist < param->Diameter * 0.4)// 判断属于哪个孔径的条件时小于0.4个直径  不小于就直接下一次循环
+        {
+            s += oid[i][0];
+            t += oid[i][1];
+            is += oid[i][0];
+            it += oid[i][1];
+            cx += o[i][0];
+            cy += o[i][1];//从这里看 oid对应st的增长，o矩阵代表像素点具体偏移   两者应该要对应  这里是中心像素的对应偏移
+            //gx gy是sobel因子的卷积计算  水平方向和垂直方向
+            int gx = -src_buffer[(y - 1) * param->Width + (x - 1)] + src_buffer[(y - 1) * param->Width + (x + 1)]
+                - 2 * src_buffer[(y)*param->Width + (x - 1)] + 2 * src_buffer[(y)*param->Width + (x + 1)]
+                - src_buffer[(y + 1) * param->Width + (x - 1)] + src_buffer[(y + 1) * param->Width + (x + 1)];
+            int gy = -src_buffer[(y - 1) * param->Width + (x - 1)] - 2 * src_buffer[(y - 1) * param->Width + (x)] - src_buffer[(y - 1) * param->Width + (x + 1)]
+                + src_buffer[(y + 1) * param->Width + (x - 1)] + 2 * src_buffer[(y + 1) * param->Width + (x)] + src_buffer[(y + 1) * param->Width + (x + 1)];
+            //if (sqrt((double)gx * gx + gy * gy) > sparam->sobel_thresh)
+            //{
+            //    depth_buffer[ind] = 255;
+            //}
+            double grad = sqrt((double)gx * gx + gy * gy);  // 计算梯度
+            double res_tmp=disp_buffer[(int)(it *param->Cols + is)]*2/12.0; //这里的it is是当前像素点的孔径中心坐标  也就是当前像素点对应的深度图的坐标
+            double  times=res_tmp*1 + 1;// 二次方函数 小的越小 大的越大  
+            times= (times==0)?1:times;
+            double  times_value = (flag_buffer[0]==1)?1:times;
+            if (grad > (times_value*sparam->sobel_thresh))// times
+            {
+                int cur_blk_sum = 1000000;
+                double  tmp_blk_sum = 0;
+                char flag=0;
+                for (int j = 0; j < 6; ++j)//朝哪个方向梯度快（与周围六个孔径比较）
+                {
+                    if (fabs((double)gx * dir[j][0] + gy * dir[j][1]) / grad < 0.87)//判断梯度在哪个方向上变化最快  
+                                //试想：一个向量向6个方向投影，与最近向量最大夹角也就30度 即从cos30 为1.732/2约等于0.87  由于取了绝对值 所以会有一条直线的两个方向进行对比
+                        continue;
+                    double another_x = ox + param->Diameter * dir[j][0] + param->Origin[0];  //然后将当前像素 投影在周围6个孔径之一对应的位置 右一是0，顺时针计数到5
+                    double another_y = oy + param->Diameter * dir[j][1] + param->Origin[1];  // 加上偏置实际是因为ox为减去偏置的值
+                    flag++;
+                    
+                    for (int disp = 0; disp < sparam->max_disp; disp++)// 视差循环遍历匹配
+                    {
+                        int match_px = another_x - dir[j][0] * disp;//当前像素在另一个孔径内的坐标（another_x、y）再减去视差值这个方向上的
+                        int match_py = another_y - dir[j][1] * disp;
+                        int match_px_gx = -src_buffer[(int)((match_py - 1) * param->Width + (match_px - 1))] + src_buffer[(int)((match_py - 1) * param->Width + (match_px + 1))]
+                            - 2 * src_buffer[(int)((match_py)*param->Width + (match_px - 1))] + 2 * src_buffer[(int)((match_py)*param->Width + (match_px + 1))]
+                            - src_buffer[(int)((match_py + 1) * param->Width + (match_px - 1))] + src_buffer[(int)((match_py + 1) * param->Width + (match_px + 1))];
+                        int match_py_gy = -src_buffer[(int)((match_py - 1) * param->Width + (match_px - 1))] - 2 * src_buffer[(int)((match_py - 1) * param->Width + (match_px))] - src_buffer[(int)((match_py - 1) * param->Width + (match_px + 1))]
+                            + src_buffer[(int)((match_py + 1) * param->Width + (match_px - 1))] + 2 * src_buffer[(int)((match_py + 1) * param->Width + (match_px))] + src_buffer[(int)((match_py + 1) * param->Width + (match_px + 1))];
+                        //if (sqrt((double)gx * gx + gy * gy) > sparam->sobel_thresh)
+                        //{
+                        //    depth_buffer[ind] = 255;
+                        //}
+                        double match_grad = sqrt((double)match_px_gx * match_px_gx + match_py_gy * match_py_gy);  // 计算梯度
+                        
+                        int half_blksz = (sparam->block_size - 1) / 2;//以像素点为中心构建双重for循环 找出两个像素各自7*7的像素值差并求绝对和
+                        tmp_blk_sum = 0;
+                        for (int m = -half_blksz; m <= half_blksz; ++m)
+                        {
+                            for (int n = -half_blksz; n <= half_blksz; ++n)
+                            {
+                                tmp_blk_sum += 0.6*abs(src_buffer[(match_py + m) * param->Width + (match_px + n)] - src_buffer[(y + m) * param->Width + (x + n)])+0.2*(match_grad-grad)+0.1*fabs((double)(match_px_gx-gx))+0.1*fabs((double)(match_py_gy-gy));
+                            }
+                        }// 7*7的block做块匹配 
+                        
+                       //代码块3位置
+
+                       //寻找一个视差值使得7*7 block的SAD最小 因为视差一直在由大及小的遍历  所以要实时记录对应sad最小值的视差值  
+                        if (tmp_blk_sum < cur_blk_sum && tmp_blk_sum < sparam->block_avg_thresh * sparam->block_size * sparam->block_size)
+                        //if (tmp_blk_sum < cur_blk_sum )
+                        {
+                            //printf("%d %d\n", disp, tmp_blk_sum);
+                            cur_blk_sum = tmp_blk_sum;
+                            if (flag == 1)
+                                depth_buffer[ind] = disp;
+                            else if (flag == 2)
+                                depth_buffer[ind] = (int)((disp+depth_buffer[ind])/2);
+                            //printf("%d,%d: %d %d\n", x, y, disp, cur_blk_sum);
+                        }
+                    }//for (int disp = 0; disp < sparam->max_disp; disp++)//视差匹配搜索
+                }// for (int j = 0; j < 6; ++j)//朝哪个方向梯度快 6个孔径都遍历一遍
+            }//if (grad > sparam->sobel_thresh)//是sobel卷积后否大于阈值
+            break;
+        }//  if (dist < param->Diameter * 0.4)//判断具体属于哪个孔径  只关心孔径内的点 
+    }//for (int i = 0; i < 4; ++i)//向右下方4个孔径搜索
+
+}
